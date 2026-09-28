@@ -813,10 +813,12 @@ class Desktop:
                 steps = max(2, math.ceil(duration * 40))
                 start = time.monotonic()
                 for index in range(1, steps + 1):
-                    self._before_pointer_input(x1, y1)
                     x = round(x1 + (x2 - x1) * index / steps)
                     y = round(y1 + (y2 - y1) * index / steps)
                     _point(x, y, monitors)
+                    # Re-check the target lock AND the bounds of the computed
+                    # point: the window may have moved since the drag started.
+                    self._before_pointer_input(x, y)
                     remaining = start + duration * index / steps - time.monotonic()
                     if remaining > 0:
                         time.sleep(min(remaining, 0.05))

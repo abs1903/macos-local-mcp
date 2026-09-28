@@ -19,14 +19,20 @@ backups = state / "backups"
 args = sys.argv[1:]
 
 records = []
-for folder in sorted(backups.iterdir()):
+for folder in backups.iterdir():
     meta = folder / "metadata.json"
     if meta.is_file():
         try:
             data = json.loads(meta.read_text(encoding="utf-8"))
-            records.append((folder, data))
+            # uuid4 names are not chronological; sort by folder birth/mtime.
+            try:
+                created = folder.stat().st_birthtime
+            except AttributeError:
+                created = folder.stat().st_mtime
+            records.append((created, folder, data))
         except (OSError, ValueError):
             continue
+records.sort(key=lambda item: item[0])  # oldest first; newest = reversed
 
 if not records:
     print("No readable backups found.")
@@ -34,7 +40,7 @@ if not records:
 
 if not args or args[0] == "list":
     print(f"{len(records)} backup(s), newest first:\n")
-    for index, (folder, data) in enumerate(reversed(records), 1):
+    for index, (_created, folder, data) in enumerate(reversed(records), 1):
         info = data.get("stat", {})
         size = info.get("bytes", "?")
         print(f"[{index}] {data.get('original_path', '?')} ({size} bytes)")
@@ -49,7 +55,7 @@ if len(args) == 2 and args[0] == "restore":
         raise SystemExit("Index must be a number from the list above.")
     if not 1 <= index <= len(records):
         raise SystemExit(f"Index must be 1..{len(records)}.")
-    folder, data = list(reversed(records))[index - 1]
+    _created, folder, data = list(reversed(records))[index - 1]
     original = Path(data["original_path"])
     saved = folder / "original.bin"
     if not saved.is_file():

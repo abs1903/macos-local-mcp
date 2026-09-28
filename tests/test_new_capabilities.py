@@ -172,3 +172,82 @@ def test_seatbelt_workspace_write_without_network_blocks_dns():
     out = os.read(proc.process.stdout.fileno(), 65536).decode(errors="replace")
     proc.close()
     assert "example.com" not in out, "default sandbox unexpectedly resolved a public host"
+
+
+def test_cross_volume_directory_move_works(tmp_path):
+    from macos_local_mcp.files import Files
+    from macos_local_mcp.guard import Guard
+    guard = Guard(tmp_path / "state")
+    files = Files(guard)
+    src = tmp_path / "proj"
+    src.mkdir()
+    files.write(str(src / "a.txt"), "x")
+    files.mkdir(str(src / "sub"))
+    files.write(str(src / "sub" / "b.txt"), "y")
+    dst = tmp_path / "dest" / "proj"
+    files.mkdir(str(tmp_path / "dest"))
+    result = files.move(str(src), str(dst))
+    assert (dst / "sub" / "b.txt").exists()
+    assert not src.exists()
+
+
+def test_catastrophic_regex_rejected(tmp_path):
+    from macos_local_mcp.files import Files
+    from macos_local_mcp.guard import Guard
+    guard = Guard(tmp_path / "state")
+    files = Files(guard)
+    files.write(str(tmp_path / "a.txt"), "hello world")
+    with pytest.raises(ValueError, match="backtrack"):
+        files.search_text(str(tmp_path), "(a+)+$", is_regex=True)
+    # ordinary patterns keep working
+    hits = files.search_text(str(tmp_path), "wor.d", is_regex=True)["hits"]
+    assert len(hits) == 1
+
+
+def test_search_file_cap_reports_truncation(tmp_path):
+    from macos_local_mcp.files import Files
+    from macos_local_mcp.guard import Guard
+    guard = Guard(tmp_path / "state")
+    files = Files(guard)
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    for i in range(25):
+        files.write(str(tree / f"f{i:02d}.txt"), "needle\n")
+    result = files.search_text(str(tree), "needle", max_hits=5, max_files=10)
+    assert result["truncated"] is True
+
+
+def test_seatbelt_rejects_quote_in_cwd():
+    if sys.platform != "darwin":
+        pytest.skip("Seatbelt is macOS-only")
+    with pytest.raises(ValueError, match="quote or backslash"):
+        seatbelt_prefix('/tmp/bad"quote', "workspace-write")
+
+
+def test_drag_rechecks_computed_points_when_window_moves():
+    desktop, backend = locked_window()
+    original_move = backend.mouse_move
+
+    def move_then_shrink(x, y):
+        original_move(x, y)
+        backend._windows[0]["right"] = 100
+
+    backend.mouse_move = move_then_shrink
+    with pytest.raises(DesktopError, match="outside the locked target window"):
+        desktop.drag(10, 10, 400, 400, 0.05)
+    # mouse was released: no stuck button
+    assert any(event[0] == "button" and event[4] is False for event in backend.events)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
+def test_sandbox_profile_removed_when_launch_fails(tmp_path):
+    import tempfile
+    from macos_local_mcp.commands import Commands
+    from macos_local_mcp.guard import Guard
+    from macos_local_mcp.control import set_commands_enabled
+    cwd = Path(tempfile.mkdtemp())
+    commands = Commands(Guard(tmp_path / "state"))
+    set_commands_enabled(commands.guard, True)
+    with pytest.raises(ValueError):
+        commands.start("/nonexistent/binary", [], str(cwd), sandbox="read-only")
+    assert not list(cwd.glob(".mcp-sb-*"))

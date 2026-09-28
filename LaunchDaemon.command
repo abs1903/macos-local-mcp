@@ -1,8 +1,12 @@
 #!/bin/bash
 # LaunchAgent entry point: start the tunnel daemon if not already running.
 # KeepAlive restarts it when it exits nonzero; this script makes each start idempotent.
+# Install for any checkout location with:
+#   launchctl load ~/Library/LaunchAgents/com.jackychen.macos-local-mcp-tunnel.plist
+# and point the plist's ProgramArguments at THIS script's absolute path.
 set -euo pipefail
-cd "$HOME/ZCodeProject/macos-local-mcp"
+PROJECT="$(cd "$(dirname "$0")" && pwd)"
+cd "$PROJECT"
 
 # Skip if a verified instance is already running (same check Start.command uses).
 if [ -f .local/running.json ] && .venv/bin/python -c '
@@ -53,7 +57,7 @@ export MACOS_LOCAL_MCP_STATE="$PWD/.local"
 # recognize this launchd-managed instance instead of double-starting.
 (
   sleep 0.2
-  .venv/bin/python - "$$" "$TUNNEL" <<'PY'
+  .venv/bin/python - "$$" "$TUNNEL" "$HEALTH_FILE" <<'PY'
 import json, os, sys
 import psutil
 pid = int(sys.argv[1])
@@ -63,7 +67,7 @@ try:
         'pid': pid,
         'create_time': process.create_time(),
         'executable': os.path.realpath(process.exe()),
-        'health_file': '',
+        'health_file': sys.argv[3],
     }
     with open('.local/running.json', 'w', encoding='utf-8') as f:
         json.dump(record, f)

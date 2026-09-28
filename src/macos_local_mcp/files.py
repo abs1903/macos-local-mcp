@@ -24,6 +24,25 @@ MAX_SEARCH_FILES = 4000
 MAX_GLOB_RESULTS = 500
 SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv"}
 
+# Patterns that nest quantifiers with alternation/overlapping repeats are the
+# classic catastrophic-backtracking shape ((a+)+$, (a|a)*$). Python re has no
+# timeout, and a stuck match blocks the whole serialized action thread, so
+# reject the shape instead of trying to bound CPU at match time.
+_CATASTROPHIC_REGEX = re.compile(
+    r"\([^()]*[+*][^()]*\)[+*]"           # (…+ … )* / (…* …)+
+    r"|\([^()]*\|[^()]*\)[+*]"            # (a|b)+ style with inner quantified risk
+    r"|\([^()]*[+*][^()]*\)\{",           # (…+ …){n,}
+)
+
+
+def _reject_catastrophic_regex(pattern: str) -> None:
+    if _CATASTROPHIC_REGEX.search(pattern):
+        raise ValueError(
+            "Regular expression nests quantifiers in a way that can backtrack "
+            "catastrophically; simplify the pattern (e.g. use a literal search)")
+    if len(pattern) > 4096:
+        raise ValueError("Regular expression exceeds 4096 characters")
+
 # Destructive file tools refuse these trees even though the current user could
 # write them. Read tools stay unrestricted: the operator already granted full read.
 PROTECTED_WRITE_PREFIXES = (
@@ -297,17 +316,19 @@ class Files:
             # fsync, rename into place, then recycle the original. Never deletes.
             from send2trash import send2trash
             dst.parent.mkdir(parents=True, exist_ok=True)
-            fd, temp_name = tempfile.mkstemp(prefix=".mcp-move-", suffix=".tmp", dir=dst.parent)
-            temp = Path(temp_name)
+            if src.is_dir():
+                import shutil
+                temp = Path(tempfile.mkdtemp(prefix=".mcp-move-", suffix=".tmp", dir=dst.parent))
+                fd = None
+            else:
+                fd, temp_name = tempfile.mkstemp(prefix=".mcp-move-", suffix=".tmp", dir=dst.parent)
+                temp = Path(temp_name)
             try:
                 if src.is_dir():
-                    temp.unlink()
-                    temp.rmdir()
-                    import shutil
+                    os.rmdir(temp)  # copytree wants a non-existent destination
                     shutil.copytree(src, temp, symlinks=True)
                     os.rename(temp, dst)
                 else:
-                    self.regular(src)
                     with src.open("rb") as reader, os.fdopen(fd, "wb") as writer:
                         while block := reader.read(MAX_READ):
                             self.guard.check()
@@ -318,7 +339,7 @@ class Files:
                     os.rename(temp, dst)
             except BaseException:
                 if temp.exists():
-                    temp.unlink(missing_ok=True)
+                    shutil.rmtree(temp, ignore_errors=True) if temp.is_dir() else temp.unlink(missing_ok=True)
                 raise
             send2trash(str(src))
             return {"source": str(src), "destination": str(dst), "cross_volume": True}
@@ -403,6 +424,7 @@ class Files:
         if not 1 <= max_hits <= MAX_SEARCH_HITS or not 1 <= max_files <= MAX_SEARCH_FILES:
             raise ValueError(f"max_hits must be 1..{MAX_SEARCH_HITS} and max_files 1..{MAX_SEARCH_FILES}")
         if is_regex:
+            _reject_catastrophic_regex(pattern)
             try:
                 compiled = re.compile(pattern)
             except re.error as exc:
@@ -416,6 +438,7 @@ class Files:
             return needle in line.lower()
 
         p = self.path(path)
+        hits, scanned, truncated_files = [], 0, False
         if p.is_file():
             files = [p]
         elif p.is_dir():
@@ -429,13 +452,13 @@ class Files:
                         continue
                     files.append(candidate)
                     if len(files) >= max_files:
+                        truncated_files = True  # more candidates exist beyond the cap
                         break
                 if len(files) >= max_files:
                     break
         else:
             raise FileNotFoundError(str(p))
 
-        hits, scanned, truncated_files = [], 0, False
         for candidate in files:
             if len(hits) >= max_hits or scanned >= max_files:
                 truncated_files = True

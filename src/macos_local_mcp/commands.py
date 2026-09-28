@@ -93,6 +93,13 @@ SEATBELT_PROFILES = {
 }
 
 
+def _sbpl_quote(path: str) -> str:
+    """Escape a path for an SBPL quoted string literal. SBPL strings use
+    C-style backslash escapes; a raw quote/backslash in a directory name would
+    otherwise terminate the literal and silently change the parsed rules."""
+    return path.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def seatbelt_prefix(cwd: str, profile: str, network: bool = False) -> list[str]:
     """Return the sandbox-exec argv prefix; PosixProcess appends the real command.
     Apple marks sandbox-exec deprecated but every current macOS still ships it.
@@ -100,8 +107,13 @@ def seatbelt_prefix(cwd: str, profile: str, network: bool = False) -> list[str]:
     builds); the default keeps the sandbox offline."""
     if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").exists():
         raise ValueError("sandbox profiles require macOS sandbox-exec (/usr/bin/sandbox-exec)")
+    if '"' in cwd or "\\" in cwd:
+        raise ValueError(
+            "cwd contains a quote or backslash that the Seatbelt profile language "
+            "cannot carry safely; run the command without a sandbox")
     script = SEATBELT_PROFILES[profile].replace(
-        "{network}", "(allow network*)" if network else "").replace("{cwd}", cwd)
+        "{network}", "(allow network*)" if network else ""
+    ).replace("{cwd}", _sbpl_quote(cwd))
     fd, name = tempfile.mkstemp(prefix=".mcp-sb-", suffix=".sb", dir=cwd)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(script)
@@ -370,7 +382,19 @@ class Commands:
                     raise PermissionError("Command permission was revoked")
                 wrapper = (seatbelt_prefix(str(directory), sandbox, network=network)
                            if sandbox else None)
-                process = PosixProcess(str(exe), list(arguments), str(directory), env, sandbox_argv=wrapper)
+                profile_path = Path(wrapper[2]) if wrapper else None
+                try:
+                    process = PosixProcess(str(exe), list(arguments), str(directory), env,
+                                           sandbox_argv=wrapper)
+                except BaseException:
+                    # No PosixProcess exists yet, so its close() will not run;
+                    # remove the profile ourselves to avoid littering cwd.
+                    if profile_path is not None:
+                        try:
+                            profile_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    raise
                 job.pid = process.pid
                 self.jobs[job.identifier] = job
                 job.worker = threading.Thread(target=self._watch, args=(job, process, encoding),
