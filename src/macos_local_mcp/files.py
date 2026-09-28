@@ -5,6 +5,7 @@ import base64
 import binascii
 import ctypes
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,18 @@ from .text_edit import replace_text_bytes
 
 MAX_READ = 1024 * 1024
 MAX_WRITE = 8 * 1024 * 1024
+
+
+# Destructive file tools refuse these trees even though the current user could
+# write them. Read tools stay unrestricted: the operator already granted full read.
+PROTECTED_WRITE_PREFIXES = (
+    "~/.ssh",
+    "~/.gnupg",
+    "~/.aws",
+    "~/.config/gcloud",
+    "~/Library/Keychains",
+    "~/Library/Cookies",
+)
 
 
 def _version(st: os.stat_result) -> str:
@@ -106,13 +119,20 @@ class Files:
 
     def path(self, value: str, *, mutation: bool = False) -> Path:
         lexical = lexical_local_path(value)
-        if mutation and lexical.exists() and lexical.is_symlink():
+        if mutation and lexical.is_symlink():
             raise ValueError("Mutating a symlink is unsupported; choose the actual path explicitly")
         p = valid_local_path(value)
         if p == self.guard.state or self.guard.state in p.parents:
             raise PermissionError("Service credentials, backups and audit data are local-operator only")
         if mutation and (p == PROJECT or PROJECT in p.parents):
             raise PermissionError("Use local controls to change this service")
+        if mutation:
+            for raw in PROTECTED_WRITE_PREFIXES:
+                tree = valid_local_path(raw)
+                if p == tree or tree in p.parents:
+                    raise PermissionError(
+                        f"Refusing to modify credential/sensitive path {tree}; the operator can do this locally"
+                    )
         return p
 
     def protect_tree(self, p: Path) -> None:
@@ -127,6 +147,7 @@ class Files:
             Path("/bin"),
             Path("/sbin"),
         ]
+        protected.extend(valid_local_path(raw) for raw in PROTECTED_WRITE_PREFIXES)
         if p == Path("/") or any(p == q or p in q.parents for q in protected):
             raise PermissionError("Refusing to move or recycle a protected directory tree")
 
@@ -377,13 +398,23 @@ class Files:
         return {"path": str(p)}
 
     def move(self, source: str, destination: str) -> dict:
+        from .moves import rename_noreplace, cross_volume_move
         src = self.path(source, mutation=True)
         dst = self.path(destination, mutation=True)
         self.protect_tree(src)
-        if dst.exists():
+        if dst.exists() or dst.is_symlink():
             raise FileExistsError("Destination already exists; move never overwrites")
+        if src == dst or src in dst.parents:
+            raise ValueError("Destination must not be inside the source tree")
+        if not dst.parent.is_dir():
+            raise FileNotFoundError("Destination parent must already exist")
         self.guard.check()
-        os.rename(src, dst)
+        try:
+            rename_noreplace(src, dst)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            return cross_volume_move(self, src, dst)
         return {"source": str(src), "destination": str(dst)}
 
     def recycle(self, path: str) -> dict:
@@ -395,3 +426,46 @@ class Files:
         self.guard.check()
         send2trash(str(p))
         return {"path": str(p), "recycled": True}
+
+    def file_hash(self, path: str, algorithm: str = "sha256") -> dict:
+        """Hash one stable regular file, without following a replacement symlink."""
+        if algorithm not in ("sha256", "md5", "sha1"):
+            raise ValueError("algorithm must be sha256, md5, or sha1")
+        self.guard.check()
+        p = self.path(path)
+        self.regular(p)
+        before_path = p.stat()
+        digest = hashlib.new(algorithm)
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(p, flags)
+        with os.fdopen(fd, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or not _same_file(before, before_path):
+                raise ValueError("File changed while opening; hash it again")
+            remaining = before.st_size
+            while remaining:
+                self.guard.check()
+                block = stream.read(min(MAX_READ, remaining))
+                if not block:
+                    raise ValueError("File changed while hashing; hash it again")
+                digest.update(block)
+                remaining -= len(block)
+            self.guard.check()
+            if (_version(os.fstat(stream.fileno())) != _version(before)
+                    or p.is_symlink() or self.path(path) != p
+                    or _version(p.stat()) != _version(before_path)):
+                raise ValueError("File changed while hashing; hash it again")
+        return {"path": str(p), "algorithm": algorithm, "hex": digest.hexdigest(),
+                "bytes": before.st_size, "version": _version(before_path)}
+
+    def glob_files(self, path: str, pattern: str, limit: int = 500,
+                   max_entries: int = 20000, timeout_seconds: int = 5) -> dict:
+        """Compatibility glob using the same bounded, link-safe search engine."""
+        from .search import search_files
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("limit must be 1..500")
+        result = search_files(self, path, pattern, limit, max_entries, timeout_seconds,
+                              [".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv"])
+        matches = result.pop("results")
+        return {**result, "matches": matches, "limit": limit}

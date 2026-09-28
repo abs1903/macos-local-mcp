@@ -6,9 +6,13 @@
 
 **English:** Give ChatGPT in Chat mode MCP-based access to local files, file writes, screen viewing, and macOS desktop control. Current version: 0.3.0.
 
-**命令行 / Commands:** 新增 `command_start`、`command_poll`、`command_cancel`，可直接运行 Git、构建、测试等本机命令，无需终端焦点。默认关闭，运行 `Enable-Commands.command` 在本机授权；使用当前用户权限，不自动提权，也不是沙箱。
+**命令行 / Commands:** `command_start`、`command_poll`、`command_cancel` 支持本机命令、查询和取消，默认关闭，只能在本机授权。可选 Seatbelt `workspace-write` / `read-only` 配置，默认断网，可显式 `network=true`；标准设备和临时目录例外见完整说明。这不是完整权限隔离。
 
-Opt-in local commands now support start, output/status polling, and cancellation without terminal focus. Enable locally with `Enable-Commands.command`. Commands use current-user permissions without automatic elevation or an OS sandbox.
+Opt-in commands support start, output/status polling and cancellation without terminal focus. Optional Seatbelt profiles reduce filesystem writes and deny network unless explicitly enabled with `network=true`; they are not a hard isolation boundary. See the full documentation for temporary-directory, device and SSH-agent exceptions.
+
+**编辑与搜索 / Editing and search:** 保留 `edit_text_file(old_text, new_text, expected_version)` 的必需版本校验和字节保留语义；`search_files` / `search_text` 提供有界文件名和字面文本搜索。新增 `glob_files`、`file_hash`，窗口级截图和鼠标边界校验。
+
+New tools: `glob_files` and `file_hash`, alongside the existing versioned editing and bounded literal-search interfaces. `desktop_screenshot(target_window=true)` captures a verified locked window; pointer input is bounded to the target or its verified modal dialog. Setup verifies the Tunnel download SHA256. Local restore backs up the live file before overwriting it.
 
 - 中文完整说明：[README.zh-CN.md](README.zh-CN.md)
 - Full English documentation: [README.en.md](README.en.md)

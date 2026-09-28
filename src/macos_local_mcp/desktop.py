@@ -405,6 +405,26 @@ class _NativeBackend:
             raise DesktopError("Could not encode the macOS screenshot.")
         return bytes(data)
 
+    def capture_window_png(self, window_id: int) -> bytes:
+        """Capture a single window image (plus its shadow-free bounds), never the
+        whole screen. Used to keep unrelated windows out of the model context."""
+        self._require_screen_recording()
+        q, a = self.Quartz, self.AppKit
+        image = q.CGWindowListCreateImage(
+            q.CGRectNull,
+            q.kCGWindowListOptionIncludingWindow,
+            window_id,
+            q.kCGWindowImageBoundsIgnoreFraming,
+        )
+        if image is None:
+            raise DesktopError("Window capture returned no image; the window may be minimized or occluded.")
+        rep = a.NSBitmapImageRep.alloc().initWithCGImage_(image)
+        png_type = getattr(a, "NSBitmapImageFileTypePNG", getattr(a, "NSPNGFileType", None))
+        data = rep.representationUsingType_properties_(png_type, {})
+        if data is None:
+            raise DesktopError("Could not encode the macOS window screenshot.")
+        return bytes(data)
+
     def _post(self, event) -> None:
         self.Quartz.CGEventPost(self.Quartz.kCGHIDEventTap, event)
 
@@ -482,6 +502,8 @@ class _NativeBackend:
 
 
 class Desktop:
+    CLICK_MARGIN = 0  # Input must land inside the locked window bounds; no slack.
+
     def __init__(self, check: Callable[[], None], backend=None):
         if not callable(check):
             raise TypeError("check must be callable.")
@@ -595,15 +617,79 @@ class Desktop:
             self._assert_input_target(verify_process=True)
             return self._target_summary() or {}
 
+    def _window_bounds(self, window_id: int) -> tuple[int, int, int, int]:
+        record = self._backend.window_record(window_id)
+        if self.input_target and record["pid"] != self.input_target["pid"]:
+            raise DesktopError("Window identity changed; explicitly select the target again.")
+        return record["left"], record["top"], record["right"], record["bottom"]
+
+    def _assert_point_in_target(self, x: int, y: int) -> None:
+        """The click/drag point must land inside the locked window's CURRENT bounds.
+
+        Modal dialogs use their own verified bounds, never a blanket exemption.
+        If the modal cannot be identified, pointer input fails closed.
+        """
+        if not self.input_target:
+            raise DesktopError("No desktop input target is locked.")
+        signature = self._backend.focused_window_signature(self.input_target["pid"])
+        if not signature:
+            raise DesktopError("Cannot verify the focused target window.")
+        window_id = self.input_target["window_id"]
+        if signature.get("modal"):
+            modal_id = signature.get("window_id")
+            if modal_id:
+                window_id = int(modal_id)
+            elif self.foreground_window() != window_id:
+                raise DesktopError("Cannot verify modal window bounds; explicitly focus the dialog.")
+        try:
+            left, top, right, bottom = self._window_bounds(window_id)
+        except DesktopError as exc:
+            raise DesktopError(
+                "The locked target window is no longer visible; re-run desktop_focus_window."
+            ) from exc
+        margin = self.CLICK_MARGIN
+        if not (left - margin <= x < right + margin and top - margin <= y < bottom + margin):
+            raise DesktopError(
+                f"Point ({x}, {y}) is outside the locked target window bounds "
+                f"({left}, {top})-({right}, {bottom}). Re-screenshot and aim inside the target, "
+                "or call desktop_focus_window explicitly to change targets."
+            )
+
     def screenshot(self, region: tuple[int, int, int, int] | None = None,
-                   max_width: int = 1600) -> tuple[bytes, dict]:
+                   max_width: int = 1600, target_window: bool = False) -> tuple[bytes, dict]:
+        """Capture the screen, or with target_window=True only the locked target window.
+
+        Window-scoped capture keeps other applications' pixels (prompt-injection
+        surface and private content) out of the model context and saves tokens.
+        The observation is still bound to the foreground window exactly like a
+        full-screen capture; a screenshot never changes the input target.
+        """
         _integer(max_width, "max_width", 64, 3840)
+        if target_window and region is not None:
+            raise ValueError("region and target_window cannot be combined")
         with self._lock:
             self._checkpoint()
-            bbox = _region(region, self._bounds())
+            window_id: int | None = None
+            if target_window:
+                if not self.input_target:
+                    raise DesktopError(
+                        "No desktop input target is locked. Call desktop_windows, then "
+                        "desktop_focus_window before requesting a window-scoped screenshot."
+                    )
+                window_id = int(self.input_target["window_id"])
             foreground_pid = self._backend.frontmost_pid()
             foreground = self.foreground_window()
-            data = self._backend.capture_png(bbox)
+            if window_id is not None:
+                if not self._process_matches(self.input_target):
+                    raise DesktopError("Target process changed; explicitly select the target again.")
+                bbox = self._window_bounds(window_id)
+                data = self._backend.capture_window_png(window_id)
+                if (not self._process_matches(self.input_target)
+                        or self._window_bounds(window_id) != bbox):
+                    raise DesktopError("Target window changed during capture; take a fresh screenshot.")
+            else:
+                bbox = _region(region, self._bounds())
+                data = self._backend.capture_png(bbox)
             self._checkpoint()
             if self._backend.frontmost_pid() != foreground_pid or self.foreground_window() != foreground:
                 raise DesktopError("Foreground focus changed during capture; take a fresh screenshot.")
@@ -641,6 +727,7 @@ class Desktop:
                 "foreground_pid": foreground_pid,
                 "input_target": self._target_summary(),
                 "input_allowed": self._snapshot_input_allowed(),
+                "window_scoped": window_id is not None,
                 "coordinate_space": "quartz_global_points",
                 "coordinate_mapping": "x = left + image_x / scale_x; y = top + image_y / scale_y",
             }
@@ -654,6 +741,10 @@ class Desktop:
     def _before_input(self) -> None:
         self._checkpoint()
         self._assert_input_target(verify_process=True)
+
+    def _before_pointer_input(self, x: int, y: int) -> None:
+        self._before_input()
+        self._assert_point_in_target(x, y)
 
     def _wait_for_released_inputs(self) -> None:
         deadline = time.monotonic() + 1.0
@@ -687,6 +778,7 @@ class Desktop:
         with self._lock:
             x, y = _point(x, y, self._backend.monitors())
             self._prepare_input()
+            self._assert_point_in_target(x, y)
             self._backend.mouse_move(x, y)
             return {"x": x, "y": y}
 
@@ -697,9 +789,10 @@ class Desktop:
         with self._lock:
             x, y = _point(x, y, self._backend.monitors())
             self._prepare_input()
+            self._assert_point_in_target(x, y)
             self._backend.mouse_move(x, y)
             for index in range(clicks):
-                self._before_input()
+                self._before_pointer_input(x, y)
                 self._backend.mouse_button(x, y, button, True)
                 try:
                     self._checkpoint()
@@ -716,21 +809,25 @@ class Desktop:
             _point(x1, y1, monitors)
             _point(x2, y2, monitors)
             self._prepare_input()
+            self._assert_point_in_target(x1, y1)
+            self._assert_point_in_target(x2, y2)
             self._backend.mouse_move(x1, y1)
-            self._before_input()
+            self._before_pointer_input(x1, y1)
             self._backend.mouse_button(x1, y1, "left", True)
             current_x, current_y = x1, y1
             try:
                 steps = max(2, math.ceil(duration * 40))
                 start = time.monotonic()
                 for index in range(1, steps + 1):
-                    self._before_input()
                     x = round(x1 + (x2 - x1) * index / steps)
                     y = round(y1 + (y2 - y1) * index / steps)
                     _point(x, y, monitors)
+                    # Re-check the target lock AND the bounds of the computed
+                    # point: the window may have moved since the drag started.
                     remaining = start + duration * index / steps - time.monotonic()
                     if remaining > 0:
                         time.sleep(min(remaining, 0.05))
+                    self._before_pointer_input(x, y)
                     self._backend.mouse_move(x, y)
                     current_x, current_y = x, y
             finally:
@@ -745,8 +842,9 @@ class Desktop:
         with self._lock:
             x, y = _point(x, y, self._backend.monitors())
             self._prepare_input()
+            self._assert_point_in_target(x, y)
             self._backend.mouse_move(x, y)
-            self._before_input()
+            self._before_pointer_input(x, y)
             self._backend.scroll(vertical, horizontal)
             return {"x": x, "y": y, "vertical": vertical, "horizontal": horizontal,
                     "units": "line notches; positive means up/right"}

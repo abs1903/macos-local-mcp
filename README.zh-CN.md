@@ -34,6 +34,7 @@
 | 递归文件名和文本搜索 | search_files、search_text |
 | 带版本检查的精确局部编辑 | edit_text_file |
 | 创建、覆盖、目录、移动、废纸篓 | write_file、create_directory、move_path、recycle_path |
+| 通配符便捷入口与内容校验 | glob_files、file_hash |
 | 显示器、窗口、截图 | desktop_monitors、desktop_windows、desktop_screenshot |
 | 激活窗口并锁定输入目标 | desktop_focus_window |
 | 鼠标 | desktop_click、desktop_move、desktop_drag、desktop_scroll |
@@ -62,6 +63,8 @@
 ```
 
 返回 `job_id` 后，用 `command_poll` 查询。同一个 `job_id` 可交给 `command_cancel`。**启动成功不等于命令成功**：只有 `state=completed` 且 `exit_code=0` 才算成功；非零退出码、超时、暂停、取消和许可撤销分别保留真实状态。
+
+`sandbox` 可选 macOS Seatbelt（`sandbox-exec`）配置。`workspace-write` 允许写解析后的工作目录和 Darwin 用户临时目录；`read-only` 拒绝普通文件系统写入。两者均保留 `/dev/null` 等标准设备访问，默认禁止网络；显式 `network=true` 可为所选配置放行网络。`sandbox=None` 保持当前用户原始权限。配置文件保存在系统临时目录，正常清理时删除；强制终止服务可能留下配置文件。这不是硬安全边界。环境过滤使用已知凭据/服务变量的拒绝名单，不能识别所有秘密；为兼容 Git/SSH，`SSH_AUTH_SOCK` 明确保留，它能够访问用户的 SSH agent，启用网络不代表凭据风险消失。不能仅因选择了配置就运行不可信命令。
 
 可执行文件和工作目录必须为绝对路径，参数必须是数组。服务不自动插入 shell，因此空格、分号、`$()` 和通配符不会被自动解释。确实需要管道或重定向时，应明确授权 `/bin/zsh` 等 shell 及其脚本参数。可通过 `environment` 传入构建所需环境变量；已知的 Tunnel/API 凭据和服务私有环境变量不会继承，也不允许覆盖。可执行文件的符号链接会保留调用路径，兼容 Homebrew 和虚拟环境。
 
@@ -117,7 +120,7 @@ chmod +x *.command
 ./Start.command
 ~~~
 
-Setup.command 会创建独立 .venv、安装 Python 依赖，并按 CPU 架构下载官方 OpenAI Tunnel client。Configure.command 把 Tunnel ID 保存到本地私有状态，把 runtime API key 保存到 macOS Keychain。
+Setup.command 会创建独立 .venv、安装 Python 依赖，并按 CPU 架构下载官方 OpenAI Tunnel client，下载后用官方 SHA256SUMS.txt 校验（不匹配即删除）。Configure.command 把 Tunnel ID 保存到本地私有状态，把 runtime API key 保存到 macOS Keychain。
 
 常用入口：
 
@@ -127,6 +130,7 @@ Check.command        检查暂停、权限和 Tunnel 状态
 Pause.command        本机暂停
 Resume.command       本机恢复
 Stop.command         停止 Tunnel
+Restore.command      浏览/恢复文件自动备份（仅本机）
 ~~~
 
 ## 文件安全语义
@@ -137,7 +141,21 @@ Stop.command         停止 Tunnel
 - symlink 不允许作为变更入口；
 - 多硬链接文件、immutable 文件以及带 ACL 或 extended attributes 的文件默认拒绝覆盖，避免原子替换丢失特殊元数据；检查 ACL 或扩展属性失败时也拒绝覆盖；
 - 删除只进入 Trash，失败时不会降级成永久删除；
-- 服务源码和 .local 中的凭据、备份、审计不会通过 MCP 文件工具开放。
+- 写入、建目录、移动和废纸篓拒绝常见凭据目录（~/.ssh、~/.gnupg、~/.aws、~/Library/Keychains、~/Library/Cookies），读取不受限制；
+- move_path 使用排他重命名防止覆盖；跨卷时复制普通文件/目录树，验证源未变化后移入 Trash。拒绝链接、特殊文件、多硬链接文件及无法保留的特殊元数据。Trash 失败时通过 `source_recycled=false` 明确报告两份副本均保留，不尝试永久删除；这不是针对恶意并发修改的文件系统事务。
+- 服务源码拒绝变更；.local 凭据、备份与审计状态拒绝读写，所有搜索工具均排除私有状态。
+
+### edit_text_file（首选编辑方式）
+
+`edit_text_file` 必须提供 `old_text`、`new_text` 及 `read_text_file` / `file_info` 返回的 `expected_version`。精确匹配必须唯一（含重叠匹配），不提供全部替换模式。支持 8 MiB 内的 UTF-8、UTF-8-sig、UTF-16、GB18030，保留未修改字节、BOM 和换行。修改前备份，版本冲突必须重读。详见[文件工具说明](docs/file-tools.md)。
+
+### search_text 与 glob_files
+
+`search_text(root, query)` 在显式目录根下执行单行字面文本搜索，默认区分大小写，不执行正则表达式。`search_files` 按文件基本名称通配符搜索；`glob_files(path, pattern)` 复用相同有界引擎，以 `matches` 返回最多 500 项。搜索跳过链接和私有状态，并限制遍历条目、时间和输出；文本搜索另有总读取字节限制。即使没有命中，也应检查 `skipped`、`truncated`、`stop_reason` 和 `complete`。
+
+### 窗口级截图与输入边界
+
+`desktop_screenshot(target_window=true)` 仅截取已验证进程/窗口身份的锁定窗口；捕获过程中身份或几何变化会拒绝结果，且不能同时指定 `region`。鼠标输入必须位于当前目标边界内；modal 弹窗使用自身已验证的边界，不再整体豁免，无法识别弹窗边界时拒绝输入。
 
 macOS 的 ACL、File Provider、iCloud、sandbox container 和第三方文件系统语义很多，当前版本不声称覆盖全部特殊元数据场景。
 
@@ -146,17 +164,24 @@ macOS 的 ACL、File Provider、iCloud、sandbox container 和第三方文件系
 当前自动化测试覆盖：
 
 - 文件创建、读取、覆盖、备份和并发检查；
+- edit_text_file 唯一性、必需版本、旧内容拒绝和编码/换行保留；
+- search_text / glob_files 上限、垃圾目录与状态目录跳过；
+- 凭据目录及父目录保护；注入 EXDEV 的跨卷移动、目标竞争创建、暂停、源变化和 Trash 失败；
 - symlink / xattr 等保护；
 - pause 和 audit；
 - observation_id 单次使用与过期；
 - “截图不能重新锁定目标”；
+- 窗口级截图必须先锁定目标；
+- 鼠标输入落在锁定窗口边界外被拒绝；
 - 用户切换到其他 App 后拒绝输入；
 - 切回目标后恢复输入；
 - 同一 App 的 modal dialog；
 - 同一 App 的另一个普通窗口拒绝；
 - 进程重启后旧 target lock 失效；
 - 输入过程中每个字符重新检查目标；
-- drag 中断后 mouse-up cleanup。
+- drag 中断后 mouse-up cleanup；
+- Seatbelt read-only / workspace-write 强制力与配置清理（macOS）；
+- 已知凭据环境变量过滤、本机恢复确认与备份、原子启动交接记录。
 
 GitHub Actions 会同时运行 portable tests 和 macOS runner 测试，并在 macOS runner 上验证 PyObjC / Quartz / AppKit 以及本项目使用的原生 API 是否存在。
 
@@ -196,3 +221,9 @@ MIT License，详见 [LICENSE](LICENSE)。
 ## 文件编辑与搜索（0.3.0）
 
 先用 `search_files` 或 `search_text` 缩小范围，再用 `read_text_file` 读取所需正文，把同次读取返回的字符串 `version` 原样传给 `edit_text_file.expected_version`。编辑只接受唯一的精确匹配；冲突时重新读取。修改前备份，保留未修改字节、BOM 和 UTF-16 端序。搜索有结果数、扫描量和时间限制，需查看返回的跳过及截断信息。三个工具均不要求开启命令执行。详见[参数、编码与边界](docs/file-tools.md)。
+
+### 本机恢复与 LaunchAgent
+
+`Restore.command list` 按新到旧列出备份；`restore <序号>` 仅恢复内容。目标存在时从标准输入请求确认，并先备份现有内容。保留当前普通权限位，但不恢复历史所有者、ACL 和时间戳，遇到不安全元数据会拒绝。恢复遵守本机暂停和受保护路径规则。
+
+`LaunchDaemon.command` 虽沿用该文件名，但实际为**用户级 LaunchAgent** 入口，不能安装为 root daemon。由本机 plist 指向脚本，并采用 `KeepAlive.SuccessfulExit=false`。不要与 `Start.command` 并发启动：现有实例检查不是启动互斥锁。启动交接前原子记录预期 Tunnel 可执行文件；Keychain/TCC 交互仍需要实机验证。
