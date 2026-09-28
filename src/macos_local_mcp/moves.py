@@ -82,6 +82,8 @@ def _snapshot(files, source: Path) -> dict[str, str]:
 def _copy_file(files, source: str | Path, destination: str | Path) -> str:
     source, destination = Path(source), Path(destination)
     files.guard.check()
+    if files.path(str(source), mutation=True) != source:
+        raise ValueError("Source path changed while copying")
     before_path = source.lstat()
     if not stat.S_ISREG(before_path.st_mode):
         raise ValueError("Source changed before copying")
@@ -109,6 +111,27 @@ def _copy_file(files, source: str | Path, destination: str | Path) -> str:
     return str(destination)
 
 
+
+def _copy_metadata(path: Path) -> tuple[int, int, int]:
+    st = path.lstat()
+    return st.st_mode, st.st_uid, st.st_gid
+
+
+def _verify_copy_metadata(files, source: Path, staged: Path, before: dict[str, str]) -> None:
+    # copystat preserves mode/times, not ownership. A destination filesystem or
+    # setgid parent may silently change the group: refuse before publication/Trash.
+    for relative, expected_version in before.items():
+        files.guard.check()
+        original = source / relative
+        if files.path(str(original), mutation=True) != original:
+            raise ValueError("Source path changed while verifying the copy")
+        st = original.lstat()
+        if _version(st) != expected_version:
+            raise ValueError("Source changed while verifying the copy")
+        if (st.st_mode, st.st_uid, st.st_gid) != _copy_metadata(staged / relative):
+            raise ValueError("Copy would change file type, mode or ownership; original left untouched")
+
+
 def cross_volume_move(files, source: Path, destination: Path) -> dict:
     from send2trash import send2trash
     before = _snapshot(files, source)
@@ -124,6 +147,7 @@ def cross_volume_move(files, source: Path, destination: Path) -> dict:
         files.guard.check()
         if _snapshot(files, source) != before:
             raise ValueError("Source changed during copy; original left untouched")
+        _verify_copy_metadata(files, source, staged, before)
         rename_noreplace(staged, destination)
     files.guard.check()
     if _snapshot(files, source) != before:

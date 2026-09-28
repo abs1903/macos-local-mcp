@@ -35,7 +35,7 @@ ENCODINGS = ("utf-8", "gb18030", "utf-16-le", "cp1252")
 _SECRET_ENV = {"OPENAI_API_KEY", "OPENAI_ADMIN_KEY", "RUNTIME_KEY", "RUNTIME_API_KEY",
                "TUNNEL_API_KEY", "MCP_COMMAND"}
 _PRIVATE_PREFIXES = ("MACOS_LOCAL_MCP_", "CONTROL_PLANE_", "MCP_TUNNEL_", "OPENAI_TUNNEL_")
-# Credential-shaped variables never pass through to command children. This is a
+# Known credential-shaped variables never pass through to command children. This is a
 # denylist rather than an allowlist because builds legitimately need most of the
 # environment, but the tokens most likely to sit in a developer shell are covered.
 _CREDENTIAL_NAMES = {
@@ -49,9 +49,9 @@ _CREDENTIAL_NAMES = {
 }
 _CREDENTIAL_PREFIXES = ("AWS_", "AZURE_", "GOOGLE_", "STRIPE_", "SLACK_",
                         "TELEGRAM_", "DISCORD_", "SENTRY_AUTH", "FIREBASE_")
-# The agent socket path is not itself a secret and builds/git often need it;
-# only agent forwarding to untrusted hosts would be a risk, which the sandbox
-# network policy already bounds.
+# Git/SSH builds can use the retained SSH_AUTH_SOCK to access the user agent.
+# This is credential-bearing capability even though the path is not a secret;
+# a sandbox profile does not make arbitrary commands safe to run.
 _SSH_AGENT_VARS = ("SSH_AGENT_PID",)
 
 
@@ -102,7 +102,7 @@ def _sbpl_quote(path: str) -> str:
 
 def seatbelt_prefix(cwd: str, profile: str, network: bool = False) -> list[str]:
     """Return the sandbox-exec argv prefix; PosixProcess appends the real command.
-    Apple marks sandbox-exec deprecated but every current macOS still ships it.
+    Availability is checked at runtime; unsupported hosts fail closed.
     network=True allows outbound network inside the sandbox (needed for git/ssh
     builds); the default keeps the sandbox offline."""
     if profile not in SEATBELT_PROFILES or type(network) is not bool:
@@ -114,7 +114,7 @@ def seatbelt_prefix(cwd: str, profile: str, network: bool = False) -> list[str]:
     if '"' in cwd or "\\" in cwd:
         raise ValueError(
             "cwd contains a quote or backslash that the Seatbelt profile language "
-            "cannot carry safely; run the command without a sandbox")
+            "cannot carry safely; choose a working directory without those characters")
     script = SEATBELT_PROFILES[profile].replace(
         "{network}", "(allow network*)" if network else ""
     ).replace("{cwd}", _sbpl_quote(cwd))

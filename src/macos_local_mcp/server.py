@@ -121,7 +121,7 @@ def build_server(guard: Guard | None = None) -> tuple[FastMCP, Runtime]:
 
         Supply an absolute executable path, argument array, and existing cwd.
         No implicit shell, terminal focus, interactive stdin, or automatic elevation.
-        Prefer sandbox="workspace-write" (writes confined to cwd; add network=true
+        Prefer sandbox="workspace-write" (writes in cwd, Darwin temp and standard devices; add network=true
         for git/ssh/builds that need the network) or sandbox="read-only" for pure
         inspection; sandbox=None keeps raw current-user permissions. Known credential-
         shaped environment variables are filtered; SSH_AUTH_SOCK is retained. Poll the

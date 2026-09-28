@@ -4,7 +4,6 @@ from __future__ import annotations
 import errno
 import os
 from pathlib import Path
-import shutil
 
 import pytest
 import send2trash
@@ -184,3 +183,24 @@ def test_destination_inside_source_is_rejected(files, tmp_path):
     source.mkdir()
     with pytest.raises(ValueError, match="inside the source"):
         files.move(str(source), str(source / "nested"))
+
+
+@pytest.mark.parametrize("directory", [False, True])
+def test_cross_volume_refuses_silent_ownership_changes(files, tmp_path, monkeypatch, directory):
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    if directory:
+        source.mkdir()
+        (source / "child").write_bytes(b"original")
+    else:
+        source.write_bytes(b"original")
+    force_cross_volume(monkeypatch, source)
+    recycled = fake_trash(monkeypatch, tmp_path)
+    actual_metadata = moves._copy_metadata
+    def changed_group(path):
+        mode, uid, gid = actual_metadata(path)
+        return mode, uid, gid + 1  # destination filesystem inherited a different group
+    monkeypatch.setattr(moves, "_copy_metadata", changed_group)
+    with pytest.raises(ValueError, match="ownership"):
+        files.move(str(source), str(destination))
+    assert source.exists() and not destination.exists() and recycled == []
+    assert not list(tmp_path.glob(".mcp-move-*"))
