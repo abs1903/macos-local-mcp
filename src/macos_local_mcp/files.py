@@ -46,8 +46,17 @@ def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
                ("st_dev", "st_ino", "st_size", "st_mtime_ns"))
 
 
+# com.apple.provenance is stamped by the OS itself on files created by running
+# processes (macOS 26+); it carries no user metadata, so it does not block an
+# overwrite that would otherwise discard metadata.
+_SYSTEM_XATTRS = {"com.apple.provenance"}
+
+
 def _has_xattrs(p: Path) -> bool:
-    """Inspect Darwin xattrs natively; Python's os xattr helpers are Linux-only."""
+    """Inspect Darwin xattrs natively; Python's os xattr helpers are Linux-only.
+
+    System-stamped xattrs (com.apple.provenance) do not count: they carry no
+    user metadata and macOS 26 adds them to every file a process creates."""
     if sys.platform != "darwin":
         # Portable tests may run on Linux or Windows; this is not a Darwin check.
         listxattr = getattr(os, "listxattr", None)
@@ -66,7 +75,24 @@ def _has_xattrs(p: Path) -> bool:
         size = list_xattrs(fd, None, 0, 0)
         if size < 0:
             raise OSError(ctypes.get_errno(), "Unable to inspect extended attributes", str(p))
-        return size > 0
+        if size == 0:
+            return False
+        # Second call to actually read names; a mocked backend may only support
+        # the sizing call, so fall back to "has xattrs" on read failure shapes.
+        try:
+            buf = ctypes.create_string_buffer(size)
+            ctypes.set_errno(0)
+            read = list_xattrs(fd, buf, size, 0)
+        except (ctypes.ArgumentError, TypeError, AssertionError):
+            return True  # names unreadable in this environment; assume present
+        if read < 0:
+            raise OSError(ctypes.get_errno(), "Unable to list extended attributes", str(p))
+        names = [n for n in buf.raw[:read].split(b"\x00") if n]
+        user_xattrs = [
+            name.decode("utf-8", "replace") for name in names
+            if name.decode("utf-8", "replace") != "com.apple.provenance"
+        ]
+        return bool(user_xattrs)
     finally:
         os.close(fd)
 
