@@ -619,27 +619,28 @@ class Desktop:
 
     def _window_bounds(self, window_id: int) -> tuple[int, int, int, int]:
         record = self._backend.window_record(window_id)
+        if self.input_target and record["pid"] != self.input_target["pid"]:
+            raise DesktopError("Window identity changed; explicitly select the target again.")
         return record["left"], record["top"], record["right"], record["bottom"]
 
     def _assert_point_in_target(self, x: int, y: int) -> None:
         """The click/drag point must land inside the locked window's CURRENT bounds.
 
-        Foreground/focused-window checks alone still permit clicking the menu bar
-        or another same-process surface; bounds close that hole. Bounds are
-        re-fetched at input time, never cached from focus time. When the focused
-        window in the target process is a modal sheet/dialog, bounds are skipped:
-        sheets legitimately extend past recorded window bounds, and the process +
-        focused-window lock still apply.
+        Modal dialogs use their own verified bounds, never a blanket exemption.
+        If the modal cannot be identified, pointer input fails closed.
         """
         if not self.input_target:
-            return  # _assert_input_target already reported the real problem.
-        try:
-            signature = self._backend.focused_window_signature(self.input_target["pid"])
-        except DesktopError:
-            signature = None
-        if signature and signature.get("modal"):
-            return
+            raise DesktopError("No desktop input target is locked.")
+        signature = self._backend.focused_window_signature(self.input_target["pid"])
+        if not signature:
+            raise DesktopError("Cannot verify the focused target window.")
         window_id = self.input_target["window_id"]
+        if signature.get("modal"):
+            modal_id = signature.get("window_id")
+            if modal_id:
+                window_id = int(modal_id)
+            elif self.foreground_window() != window_id:
+                raise DesktopError("Cannot verify modal window bounds; explicitly focus the dialog.")
         try:
             left, top, right, bottom = self._window_bounds(window_id)
         except DesktopError as exc:
@@ -664,6 +665,8 @@ class Desktop:
         full-screen capture; a screenshot never changes the input target.
         """
         _integer(max_width, "max_width", 64, 3840)
+        if target_window and region is not None:
+            raise ValueError("region and target_window cannot be combined")
         with self._lock:
             self._checkpoint()
             window_id: int | None = None
@@ -677,10 +680,13 @@ class Desktop:
             foreground_pid = self._backend.frontmost_pid()
             foreground = self.foreground_window()
             if window_id is not None:
+                if not self._process_matches(self.input_target):
+                    raise DesktopError("Target process changed; explicitly select the target again.")
+                bbox = self._window_bounds(window_id)
                 data = self._backend.capture_window_png(window_id)
-                # Window images are anchored at the window origin, not the screen origin.
-                left, top, right, bottom = self._window_bounds(window_id)
-                bbox = (left, top, right, bottom)
+                if (not self._process_matches(self.input_target)
+                        or self._window_bounds(window_id) != bbox):
+                    raise DesktopError("Target window changed during capture; take a fresh screenshot.")
             else:
                 bbox = _region(region, self._bounds())
                 data = self._backend.capture_png(bbox)
@@ -818,10 +824,10 @@ class Desktop:
                     _point(x, y, monitors)
                     # Re-check the target lock AND the bounds of the computed
                     # point: the window may have moved since the drag started.
-                    self._before_pointer_input(x, y)
                     remaining = start + duration * index / steps - time.monotonic()
                     if remaining > 0:
                         time.sleep(min(remaining, 0.05))
+                    self._before_pointer_input(x, y)
                     self._backend.mouse_move(x, y)
                     current_x, current_y = x, y
             finally:

@@ -1,22 +1,30 @@
 #!/bin/bash
-# LaunchAgent entry point: start the tunnel daemon if not already running.
-# KeepAlive restarts it when it exits nonzero; this script makes each start idempotent.
-# Install for any checkout location with:
-#   launchctl load ~/Library/LaunchAgents/com.jackychen.macos-local-mcp-tunnel.plist
-# and point the plist's ProgramArguments at THIS script's absolute path.
+# User LaunchAgent entry point, not a root LaunchDaemon.
+# Point the LaunchAgent plist's ProgramArguments at this script's absolute path.
+# Use KeepAlive.SuccessfulExit=false; do not unconditionally restart an already-running instance.
 set -euo pipefail
+umask 077
 PROJECT="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT"
+PYTHON="$PWD/.venv/bin/python"
+if [ ! -x "$PYTHON" ]; then
+  echo "Run ./Setup.command first." >&2
+  exit 1
+fi
+if [ ! -f .local/connection.json ]; then
+  echo "Run ./Configure.command first." >&2
+  exit 1
+fi
 
-# Skip if a verified instance is already running (same check Start.command uses).
-if [ -f .local/running.json ] && .venv/bin/python -c '
+# Skip an existing verified instance. This is an identity check, not a startup mutex.
+if [ -f .local/running.json ] && "$PYTHON" -c '
 import json, os, psutil
 try:
     r = json.load(open(".local/running.json", encoding="utf-8"))
     p = psutil.Process(int(r["pid"]))
     ok = (abs(float(p.create_time()) - float(r["create_time"])) < 0.01
           and os.path.realpath(p.exe()) == os.path.realpath(r["executable"]))
-except Exception:
+except (OSError, ValueError, KeyError, psutil.Error):
     ok = False
 raise SystemExit(0 if ok else 1)
 '; then
@@ -29,15 +37,9 @@ if [ -z "$TUNNEL" ]; then
   echo "tunnel-client missing; run Setup.command" >&2
   exit 1
 fi
-if [ ! -f .local/connection.json ]; then
-  echo "not configured; run Configure.command" >&2
-  exit 1
-fi
-
-TUNNEL_ID="$(python3 -c 'import json; print(json.load(open(".local/connection.json"))["tunnel_id"])')"
+TUNNEL_ID="$("$PYTHON" -c 'import json; print(json.load(open(".local/connection.json"))["tunnel_id"])')"
 RUNTIME_KEY="$(security find-generic-password -s macos-local-mcp-runtime -a "$USER" -w)"
 
-# Stale per-start health files + log rotation (same hygiene as Start.command).
 find .local -maxdepth 1 -name 'health-*.url' -type f -delete 2>/dev/null || true
 for log in .local/tunnel.stdout.log .local/tunnel.stderr.log; do
   if [ -f "$log" ] && [ "$(stat -f %z "$log" 2>/dev/null || echo 0)" -gt 10485760 ]; then
@@ -45,39 +47,14 @@ for log in .local/tunnel.stdout.log .local/tunnel.stderr.log; do
   fi
 done
 HEALTH_FILE="$PWD/.local/health-$(date +%s)-$$.url"
-
 export CONTROL_PLANE_API_KEY="$RUNTIME_KEY"
 export CONTROL_PLANE_TUNNEL_ID="$TUNNEL_ID"
-export MCP_COMMAND="\"$PWD/.venv/bin/python\" -m macos_local_mcp"
+export MCP_COMMAND="\"$PYTHON\" -m macos_local_mcp"
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
 export MACOS_LOCAL_MCP_STATE="$PWD/.local"
+unset RUNTIME_KEY
 
-# Track our PID like Start.command does, so Check.command and Start.command
-# recognize this launchd-managed instance instead of double-starting.
-(
-  sleep 0.2
-  .venv/bin/python - "$$" "$TUNNEL" "$HEALTH_FILE" <<'PY'
-import json, os, sys
-import psutil
-pid = int(sys.argv[1])
-try:
-    process = psutil.Process(pid)
-    record = {
-        'pid': pid,
-        'create_time': process.create_time(),
-        'executable': os.path.realpath(process.exe()),
-        'health_file': sys.argv[3],
-    }
-    with open('.local/running.json', 'w', encoding='utf-8') as f:
-        json.dump(record, f)
-    os.chmod('.local/running.json', 0o600)
-except psutil.Error:
-    pass  # daemon exited; KeepAlive will retry and rewrite the record
-PY
-) &
-
-exec "$TUNNEL" run \
-  --health.listen-addr 127.0.0.1:0 \
-  --health.url-file "$HEALTH_FILE" \
-  --mcp.stdio-send-initialized-notification
+# Record the intended executable atomically before exec, without a timed background writer.
+exec "$PYTHON" -m macos_local_mcp.launchd "$TUNNEL" "$HEALTH_FILE" \
+  >>.local/tunnel.stdout.log 2>>.local/tunnel.stderr.log

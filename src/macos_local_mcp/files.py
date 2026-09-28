@@ -3,45 +3,23 @@ from __future__ import annotations
 
 import base64
 import binascii
-import fnmatch
+import ctypes
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import stat
+import sys
 import tempfile
 from uuid import uuid4
 
 from .guard import Guard, PROJECT
+from .text_edit import replace_text_bytes
 
 MAX_READ = 1024 * 1024
 MAX_WRITE = 8 * 1024 * 1024
-MAX_EDIT_FILE = 8 * 1024 * 1024
-MAX_GREP_BYTES = 16 * 1024 * 1024
-MAX_SEARCH_HITS = 200
-MAX_SEARCH_FILES = 4000
-MAX_GLOB_RESULTS = 500
-SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv"}
 
-# Patterns that nest quantifiers with alternation/overlapping repeats are the
-# classic catastrophic-backtracking shape ((a+)+$, (a|a)*$). Python re has no
-# timeout, and a stuck match blocks the whole serialized action thread, so
-# reject the shape instead of trying to bound CPU at match time.
-_CATASTROPHIC_REGEX = re.compile(
-    r"\([^()]*[+*][^()]*\)[+*]"           # (…+ … )* / (…* …)+
-    r"|\([^()]*\|[^()]*\)[+*]"            # (a|b)+ style with inner quantified risk
-    r"|\([^()]*[+*][^()]*\)\{",           # (…+ …){n,}
-)
-
-
-def _reject_catastrophic_regex(pattern: str) -> None:
-    if _CATASTROPHIC_REGEX.search(pattern):
-        raise ValueError(
-            "Regular expression nests quantifiers in a way that can backtrack "
-            "catastrophically; simplify the pattern (e.g. use a literal search)")
-    if len(pattern) > 4096:
-        raise ValueError("Regular expression exceeds 4096 characters")
 
 # Destructive file tools refuse these trees even though the current user could
 # write them. Read tools stay unrestricted: the operator already granted full read.
@@ -53,6 +31,73 @@ PROTECTED_WRITE_PREFIXES = (
     "~/Library/Keychains",
     "~/Library/Cookies",
 )
+
+
+def _version(st: os.stat_result) -> str:
+    """A stat identity/version token, not a content hash."""
+    return "v1:" + ":".join(str(getattr(st, name)) for name in
+                            ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns"))
+
+
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    # Windows Python 3.13 reports ctime differently for paths and open fds.
+    # Compare ctime within each API across the read, and identity across APIs.
+    return all(getattr(left, name) == getattr(right, name) for name in
+               ("st_dev", "st_ino", "st_size", "st_mtime_ns"))
+
+
+def _has_xattrs(p: Path) -> bool:
+    """Inspect Darwin xattrs natively; Python's os xattr helpers are Linux-only."""
+    if sys.platform != "darwin":
+        # Portable tests may run on Linux or Windows; this is not a Darwin check.
+        listxattr = getattr(os, "listxattr", None)
+        return bool(listxattr(p)) if listxattr is not None else False
+    try:
+        library = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        list_xattrs = library.flistxattr
+    except (AttributeError, OSError) as exc:
+        raise OSError("Extended attribute inspection is unavailable") from exc
+    # Darwin sys/xattr.h: ssize_t flistxattr(int, char *, size_t, int).
+    list_xattrs.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    list_xattrs.restype = ctypes.c_ssize_t
+    fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        ctypes.set_errno(0)
+        size = list_xattrs(fd, None, 0, 0)
+        if size < 0:
+            raise OSError(ctypes.get_errno(), "Unable to inspect extended attributes", str(p))
+        return size > 0
+    finally:
+        os.close(fd)
+
+
+def _has_acl(p: Path) -> bool:
+    """Inspect Darwin ACL metadata through an open fd and fail closed on errors."""
+    library = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    get_acl = library.acl_get_fd
+    get_acl.argtypes = [ctypes.c_int]
+    get_acl.restype = ctypes.c_void_p
+    free_acl = library.acl_free
+    free_acl.argtypes = [ctypes.c_void_p]
+    free_acl.restype = ctypes.c_int
+    fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        ctypes.set_errno(0)
+        acl = get_acl(fd)
+        if not acl:
+            error = ctypes.get_errno()
+            # Darwin filesec_get_property uses ENOENT for an absent ACL.
+            # Using an already-open fd removes pathname-not-found ambiguity.
+            if error == errno.ENOENT:
+                return False
+            raise OSError(error, "Unable to inspect file ACL", str(p))
+        try:
+            return True
+        finally:
+            if free_acl(acl) != 0:
+                raise OSError(ctypes.get_errno(), "Unable to release file ACL", str(p))
+    finally:
+        os.close(fd)
 
 
 def lexical_local_path(value: str) -> Path:
@@ -74,7 +119,7 @@ class Files:
 
     def path(self, value: str, *, mutation: bool = False) -> Path:
         lexical = lexical_local_path(value)
-        if mutation and lexical.exists() and lexical.is_symlink():
+        if mutation and lexical.is_symlink():
             raise ValueError("Mutating a symlink is unsupported; choose the actual path explicitly")
         p = valid_local_path(value)
         if p == self.guard.state or self.guard.state in p.parents:
@@ -102,6 +147,7 @@ class Files:
             Path("/bin"),
             Path("/sbin"),
         ]
+        protected.extend(valid_local_path(raw) for raw in PROTECTED_WRITE_PREFIXES)
         if p == Path("/") or any(p == q or p in q.parents for q in protected):
             raise PermissionError("Refusing to move or recycle a protected directory tree")
 
@@ -120,6 +166,7 @@ class Files:
             "bytes": s.st_size,
             "modified_ns": s.st_mtime_ns,
             "created_ns": s.st_birthtime_ns if hasattr(s, "st_birthtime_ns") else s.st_ctime_ns,
+            "version": _version(s),
         }
 
     def list_directory(self, path: str, limit: int = 200, offset: int = 0) -> dict:
@@ -173,7 +220,11 @@ class Files:
         p = self.path(path)
         self.regular(p)
         lines, size, next_line = [], 0, None
+        before_path = p.stat()
         with p.open("r", encoding=encoding, errors="strict", newline="") as f:
+            before = os.fstat(f.fileno())
+            if not _same_file(before, before_path):
+                raise ValueError("File changed while opening; read it again")
             for number in range(1, start_line + max_lines + 1):
                 self.guard.check()
                 line = f.readline(MAX_READ + 1)
@@ -188,6 +239,8 @@ class Files:
                     break
                 lines.append(line)
                 size += len(line)
+            if _version(os.fstat(f.fileno())) != _version(before) or _version(p.stat()) != _version(before_path):
+                raise ValueError("File changed while reading; read it again")
         return {
             "path": str(p),
             "text": "".join(lines),
@@ -195,6 +248,7 @@ class Files:
             "lines": len(lines),
             "next_line": next_line,
             "encoding": encoding,
+            "version": _version(before_path),
         }
 
     def backup(self, p: Path) -> str:
@@ -229,12 +283,10 @@ class Files:
         immutable = getattr(stat, "UF_IMMUTABLE", 0) | getattr(stat, "SF_IMMUTABLE", 0)
         if flags & immutable:
             raise ValueError("Immutable files cannot be overwritten")
-        try:
-            xattrs = os.listxattr(p)
-        except (AttributeError, OSError):
-            xattrs = []
-        if xattrs:
+        if _has_xattrs(p):
             raise ValueError("File has extended attributes; refusing an overwrite that could discard metadata")
+        if sys.platform == "darwin" and _has_acl(p):
+            raise ValueError("File has an ACL; refusing an overwrite that could discard metadata")
 
     def write(self, path: str, content: str, encoding: str = "utf-8", overwrite: bool = False,
               expected_modified_ns: int | None = None) -> dict:
@@ -250,6 +302,14 @@ class Files:
         if len(data) > MAX_WRITE:
             raise ValueError("Write limit is 8 MiB per call")
 
+        return self._write_bytes(path, data, overwrite, expected_modified_ns)
+
+    def _write_bytes(self, path: str, data: bytes, overwrite: bool = False,
+                     expected_modified_ns: int | None = None,
+                     expected_version: str | None = None) -> dict:
+        if len(data) > MAX_WRITE:
+            raise ValueError("Write limit is 8 MiB per call")
+
         p = self.path(path, mutation=True)
         if not p.parent.exists() or not p.parent.is_dir():
             raise FileNotFoundError(f"Parent directory does not exist: {p.parent}")
@@ -261,6 +321,8 @@ class Files:
             self.regular(p)
             self.ordinary_overwrite(p)
         if expected_modified_ns is not None and (before is None or before.st_mtime_ns != expected_modified_ns):
+            raise ValueError("File changed since it was read; read it again before replacing")
+        if expected_version is not None and (before is None or _version(before) != expected_version):
             raise ValueError("File changed since it was read; read it again before replacing")
 
         backup = self.backup(p) if before else None
@@ -275,10 +337,9 @@ class Files:
                 os.chmod(temp, stat.S_IMODE(before.st_mode))
             self.guard.check()
             if before:
+                self.ordinary_overwrite(p)
                 current = p.stat()
-                if (current.st_mtime_ns, current.st_size, current.st_ino) != (
-                    before.st_mtime_ns, before.st_size, before.st_ino
-                ):
+                if _version(current) != _version(before):
                     raise ValueError("File changed during backup; original left untouched")
                 os.replace(temp, p)
             else:
@@ -287,12 +348,48 @@ class Files:
         finally:
             if temp.exists():
                 temp.unlink()
+        after = p.stat()
         return {
             "path": str(p),
             "bytes": len(data),
             "backup_path": backup,
-            "modified_ns": p.stat().st_mtime_ns,
+            "modified_ns": after.st_mtime_ns,
+            "version": _version(after),
         }
+
+    def edit_text(self, path: str, old_text: str, new_text: str, expected_version: str,
+                  encoding: str = "utf-8-sig") -> dict:
+        """Replace one exact occurrence, retaining all bytes outside its span."""
+        if not isinstance(expected_version, str) or not expected_version:
+            raise ValueError("expected_version must be returned by file_info or read_text_file")
+        p = self.path(path, mutation=True)
+        self.regular(p)
+        self.ordinary_overwrite(p)
+        self.guard.check()
+        before_path = p.stat()
+        with p.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            if _version(before_path) != expected_version or not _same_file(before, before_path):
+                raise ValueError("File changed since it was read; read it again before editing")
+            if before.st_size > MAX_WRITE:
+                raise ValueError("Text edit limit is 8 MiB")
+            data = stream.read(MAX_WRITE + 1)
+            if len(data) > MAX_WRITE:
+                raise ValueError("Text edit limit is 8 MiB")
+            if _version(os.fstat(stream.fileno())) != _version(before) or _version(p.stat()) != expected_version:
+                raise ValueError("File changed while reading; read it again before editing")
+        updated, change = replace_text_bytes(data, old_text, new_text, encoding)
+        self.guard.check()
+        if len(updated) > MAX_WRITE:
+            raise ValueError("Text edit limit is 8 MiB")
+        if not change["changed"]:
+            self.ordinary_overwrite(p)
+            if _version(p.stat()) != expected_version:
+                raise ValueError("File changed while editing; read it again")
+            return {"path": str(p), "bytes": len(data), "backup_path": None,
+                    "modified_ns": before.st_mtime_ns, "version": expected_version, **change}
+        result = self._write_bytes(path, updated, overwrite=True, expected_version=expected_version)
+        return {**result, **change}
 
     def mkdir(self, path: str) -> dict:
         p = self.path(path, mutation=True)
@@ -301,48 +398,23 @@ class Files:
         return {"path": str(p)}
 
     def move(self, source: str, destination: str) -> dict:
+        from .moves import rename_noreplace, cross_volume_move
         src = self.path(source, mutation=True)
         dst = self.path(destination, mutation=True)
         self.protect_tree(src)
-        if dst.exists():
+        if dst.exists() or dst.is_symlink():
             raise FileExistsError("Destination already exists; move never overwrites")
+        if src == dst or src in dst.parents:
+            raise ValueError("Destination must not be inside the source tree")
+        if not dst.parent.is_dir():
+            raise FileNotFoundError("Destination parent must already exist")
         self.guard.check()
         try:
-            os.rename(src, dst)
+            rename_noreplace(src, dst)
         except OSError as exc:
-            if exc.errno != 18:  # EXDEV: different volumes
+            if exc.errno != errno.EXDEV:
                 raise
-            # Cross-volume fallback: copy to a temp file next to the destination,
-            # fsync, rename into place, then recycle the original. Never deletes.
-            from send2trash import send2trash
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if src.is_dir():
-                import shutil
-                temp = Path(tempfile.mkdtemp(prefix=".mcp-move-", suffix=".tmp", dir=dst.parent))
-                fd = None
-            else:
-                fd, temp_name = tempfile.mkstemp(prefix=".mcp-move-", suffix=".tmp", dir=dst.parent)
-                temp = Path(temp_name)
-            try:
-                if src.is_dir():
-                    os.rmdir(temp)  # copytree wants a non-existent destination
-                    shutil.copytree(src, temp, symlinks=True)
-                    os.rename(temp, dst)
-                else:
-                    with src.open("rb") as reader, os.fdopen(fd, "wb") as writer:
-                        while block := reader.read(MAX_READ):
-                            self.guard.check()
-                            writer.write(block)
-                        writer.flush()
-                        os.fsync(writer.fileno())
-                    os.chmod(temp, stat.S_IMODE(src.stat().st_mode))
-                    os.rename(temp, dst)
-            except BaseException:
-                if temp.exists():
-                    shutil.rmtree(temp, ignore_errors=True) if temp.is_dir() else temp.unlink(missing_ok=True)
-                raise
-            send2trash(str(src))
-            return {"source": str(src), "destination": str(dst), "cross_volume": True}
+            return cross_volume_move(self, src, dst)
         return {"source": str(src), "destination": str(dst)}
 
     def recycle(self, path: str) -> dict:
@@ -356,167 +428,44 @@ class Files:
         return {"path": str(p), "recycled": True}
 
     def file_hash(self, path: str, algorithm: str = "sha256") -> dict:
+        """Hash one stable regular file, without following a replacement symlink."""
         if algorithm not in ("sha256", "md5", "sha1"):
             raise ValueError("algorithm must be sha256, md5, or sha1")
+        self.guard.check()
         p = self.path(path)
         self.regular(p)
+        before_path = p.stat()
         digest = hashlib.new(algorithm)
-        with p.open("rb") as f:
-            while block := f.read(MAX_READ):
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(p, flags)
+        with os.fdopen(fd, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or not _same_file(before, before_path):
+                raise ValueError("File changed while opening; hash it again")
+            remaining = before.st_size
+            while remaining:
                 self.guard.check()
+                block = stream.read(min(MAX_READ, remaining))
+                if not block:
+                    raise ValueError("File changed while hashing; hash it again")
                 digest.update(block)
-        return {"path": str(p), "algorithm": algorithm, "hex": digest.hexdigest(),
-                "bytes": p.stat().st_size}
-
-    def edit_text(self, path: str, old_string: str, new_string: str,
-                  expected_modified_ns: int | None = None, replace_all: bool = False) -> dict:
-        """Replace exact text, like a patch. Fails unless old_string matches exactly once
-        (unless replace_all). The file must be UTF-8 text of at most 8 MiB."""
-        if not isinstance(old_string, str) or not old_string:
-            raise ValueError("old_string must be a nonempty string")
-        if not isinstance(new_string, str):
-            raise ValueError("new_string must be a string")
-        if old_string == new_string:
-            raise ValueError("old_string and new_string are identical; nothing to do")
-        p = self.path(path, mutation=True)
-        self.regular(p)
-        if p.stat().st_size > MAX_EDIT_FILE:
-            raise ValueError("edit_text_file only supports files up to 8 MiB; use write_file")
-        try:
-            text = p.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError("edit_text_file requires UTF-8 text; use write_file for binary") from exc
-        count = text.count(old_string)
-        if count == 0:
-            raise ValueError("old_string not found; read the file again and copy the exact text")
-        if count > 1 and not replace_all:
-            raise ValueError(
-                f"old_string matches {count} times; add surrounding lines to make it unique "
-                "or pass replace_all=true"
-            )
-        updated = text.replace(old_string, new_string) if replace_all else text.replace(
-            old_string, new_string, 1)
-        result = self.write(path, updated, encoding="utf-8", overwrite=True,
-                            expected_modified_ns=expected_modified_ns)
-        return {**result, "replacements": count if replace_all else 1}
-
-    def _pruned(self, dirs: list[str], root: Path) -> None:
-        """In-place os.walk dir pruning: skip known junk dirs, symlinked dirs,
-        and the service state tree (backups/audit are local-operator data)."""
-        state = self.guard.state.resolve()  # walk roots may use /var symlink forms
-        if root.resolve() == state or state in root.resolve().parents:
-            dirs[:] = []  # Walk started inside the state tree; never descend.
-            return
-        dirs[:] = [
-            d for d in dirs
-            if d not in SKIP_DIRS
-            and not (root / d).is_symlink()
-            and (root / d).resolve() != state
-            and state not in (root / d).resolve().parents
-        ]
-
-    def search_text(self, path: str, pattern: str, is_regex: bool = False,
-                    max_hits: int = MAX_SEARCH_HITS, max_files: int = MAX_SEARCH_FILES) -> dict:
-        """Bounded grep over one file or a directory tree (skips .git/node_modules and
-        binary-looking files). Returns file:line:line-text hits, never follows symlinks."""
-        if not isinstance(pattern, str) or not pattern:
-            raise ValueError("pattern must be a nonempty string")
-        if not 1 <= max_hits <= MAX_SEARCH_HITS or not 1 <= max_files <= MAX_SEARCH_FILES:
-            raise ValueError(f"max_hits must be 1..{MAX_SEARCH_HITS} and max_files 1..{MAX_SEARCH_FILES}")
-        if is_regex:
-            _reject_catastrophic_regex(pattern)
-            try:
-                compiled = re.compile(pattern)
-            except re.error as exc:
-                raise ValueError(f"Invalid regular expression: {exc}") from exc
-        else:
-            needle = pattern.lower()
-
-        def hit_line(line: str) -> bool:
-            if is_regex:
-                return compiled.search(line) is not None
-            return needle in line.lower()
-
-        p = self.path(path)
-        hits, scanned, truncated_files = [], 0, False
-        if p.is_file():
-            files = [p]
-        elif p.is_dir():
-            files = []
-            for root, dirs, names in os.walk(p, followlinks=False):
-                self._pruned(dirs, Path(root))
-                self.guard.check()
-                for name in names:
-                    candidate = Path(root) / name
-                    if candidate.is_symlink() or not candidate.is_file():
-                        continue
-                    files.append(candidate)
-                    if len(files) >= max_files:
-                        truncated_files = True  # more candidates exist beyond the cap
-                        break
-                if len(files) >= max_files:
-                    break
-        else:
-            raise FileNotFoundError(str(p))
-
-        for candidate in files:
-            if len(hits) >= max_hits or scanned >= max_files:
-                truncated_files = True
-                break
-            try:
-                if candidate.stat().st_size > MAX_GREP_BYTES:
-                    continue
-                with candidate.open("rb") as f:
-                    head = f.read(8192)
-                if b"\x00" in head:
-                    continue  # Binary-looking file; never decode gigabytes of noise.
-                with candidate.open("r", encoding="utf-8", errors="replace") as f:
-                    for number, line in enumerate(f, 1):
-                        self.guard.check()
-                        if hit_line(line.rstrip("\r\n")):
-                            hits.append({
-                                "path": str(candidate),
-                                "line": number,
-                                "text": line.rstrip("\r\n")[:500],
-                            })
-                            if len(hits) >= max_hits:
-                                break
-                    scanned += 1
-            except OSError:
-                continue
-        return {
-            "hits": hits,
-            "files_scanned": scanned,
-            "truncated": len(hits) >= max_hits or truncated_files,
-            "next_max_hits": max_hits,
-        }
-
-    def glob_files(self, path: str, pattern: str, limit: int = MAX_GLOB_RESULTS) -> dict:
-        """List files under a directory matching a glob pattern (fnmatch syntax),
-        skipping .git/node_modules-style trees. Never follows symlinks."""
-        if not isinstance(pattern, str) or not pattern or len(pattern) > 512:
-            raise ValueError("pattern must be a nonempty glob of at most 512 characters")
-        if not 1 <= limit <= MAX_GLOB_RESULTS:
-            raise ValueError(f"limit must be 1..{MAX_GLOB_RESULTS}")
-        p = self.path(path)
-        if not p.is_dir():
-            raise FileNotFoundError(str(p))
-        matches, truncated = [], False
-        for root, dirs, names in os.walk(p, followlinks=False):
-            self._pruned(dirs, Path(root))
+                remaining -= len(block)
             self.guard.check()
-            for name in names:
-                if fnmatch.fnmatch(name, pattern):
-                    candidate = Path(root) / name
-                    if candidate.is_symlink():
-                        continue
-                    try:
-                        matches.append({"path": str(candidate), "bytes": candidate.stat().st_size})
-                    except OSError:
-                        continue
-                    if len(matches) >= limit:
-                        truncated = True
-                        break
-            if truncated:
-                break
-        return {"matches": matches, "truncated": truncated, "limit": limit}
+            if (_version(os.fstat(stream.fileno())) != _version(before)
+                    or p.is_symlink() or self.path(path) != p
+                    or _version(p.stat()) != _version(before_path)):
+                raise ValueError("File changed while hashing; hash it again")
+        return {"path": str(p), "algorithm": algorithm, "hex": digest.hexdigest(),
+                "bytes": before.st_size, "version": _version(before_path)}
+
+    def glob_files(self, path: str, pattern: str, limit: int = 500,
+                   max_entries: int = 20000, timeout_seconds: int = 5) -> dict:
+        """Compatibility glob using the same bounded, link-safe search engine."""
+        from .search import search_files
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("limit must be 1..500")
+        result = search_files(self, path, pattern, limit, max_entries, timeout_seconds,
+                              [".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv"])
+        matches = result.pop("results")
+        return {**result, "matches": matches, "limit": limit}

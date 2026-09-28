@@ -2,17 +2,17 @@
 
 [简体中文](README.zh-CN.md) · [English](README.en.md)
 
-**中文：** 让 ChatGPT 在 Chat 模式中也可以通过 MCP 读取本机文件、写入文件、查看屏幕并操作 macOS 桌面。当前版本为0.2.0。
+**中文：** 让 ChatGPT 在 Chat 模式中也可以通过 MCP 读取本机文件、写入文件、查看屏幕并操作 macOS 桌面。当前版本为 0.3.0。
 
-**English:** Give ChatGPT in Chat mode MCP-based access to local files, file writes, screen viewing, and macOS desktop control. Current version: 0.2.0.
+**English:** Give ChatGPT in Chat mode MCP-based access to local files, file writes, screen viewing, and macOS desktop control. Current version: 0.3.0.
 
-**命令行 / Commands:** 新增 `command_start`、`command_poll`、`command_cancel`，可直接运行 Git、构建、测试等本机命令，无需终端焦点。默认关闭，运行 `Enable-Commands.command` 在本机授权；使用当前用户权限，不自动提权，也不是沙箱。可选 Seatbelt 沙箱（`sandbox="workspace-write"` 限定写目录并断网，`"read-only"` 只读）并过滤凭据环境变量。
+**命令行 / Commands:** `command_start`、`command_poll`、`command_cancel` 支持本机命令、查询和取消，默认关闭，只能在本机授权。可选 Seatbelt `workspace-write` / `read-only` 配置，默认断网，可显式 `network=true`；标准设备和临时目录例外见完整说明。这不是完整权限隔离。
 
-Opt-in local commands now support start, output/status polling, and cancellation without terminal focus. Enable locally with `Enable-Commands.command`. Commands use current-user permissions without automatic elevation or an OS sandbox. An optional Seatbelt profile (`sandbox="workspace-write"` confines writes to the working directory and denies network; `"read-only"` blocks all writes) plus credential-environment filtering reduce blast radius.
+Opt-in commands support start, output/status polling and cancellation without terminal focus. Optional Seatbelt profiles reduce filesystem writes and deny network unless explicitly enabled with `network=true`; they are not a hard isolation boundary. See the full documentation for temporary-directory, device and SSH-agent exceptions.
 
-**编辑与搜索 / Editing and search:** 新增 `edit_text_file`（精确 old_string→new_string 补丁式编辑，唯一匹配校验 + 自动备份）、`search_text`（有界 grep）、`glob_files`、`file_hash`；`desktop_screenshot` 支持 `target_window=true` 只截锁定窗口；鼠标输入强制落在锁定窗口边界内。
+**编辑与搜索 / Editing and search:** 保留 `edit_text_file(old_text, new_text, expected_version)` 的必需版本校验和字节保留语义；`search_files` / `search_text` 提供有界文件名和字面文本搜索。新增 `glob_files`、`file_hash`，窗口级截图和鼠标边界校验。
 
-New tools: `edit_text_file` (exact-match patch editing with uniqueness checks and automatic backups), `search_text` (bounded grep), `glob_files`, `file_hash`; `desktop_screenshot` gains `target_window=true` window-scoped capture; pointer input must land inside the locked window's bounds. Setup.command now verifies the official Tunnel client download against the release SHA256SUMS.
+New tools: `glob_files` and `file_hash`, alongside the existing versioned editing and bounded literal-search interfaces. `desktop_screenshot(target_window=true)` captures a verified locked window; pointer input is bounded to the target or its verified modal dialog. Setup verifies the Tunnel download SHA256. Local restore backs up the live file before overwriting it.
 
 - 中文完整说明：[README.zh-CN.md](README.zh-CN.md)
 - Full English documentation: [README.en.md](README.en.md)
@@ -27,3 +27,9 @@ New tools: `edit_text_file` (exact-match patch editing with uniqueness checks an
 **English:** This is a high-privilege local tool, not an operating-system sandbox. File tools operate with the current macOS user's file permissions. Granting **Accessibility** lets the host process control ordinary applications, while **Screen Recording** lets it observe screen and window contents. macOS TCC permissions are generally granted to the actual Terminal/iTerm/host process running MCP, so the permission scope can be broader than one Python script. Target locking, pause controls, backups, and audit logs reduce mistakes but do not create a low-privilege boundary. Pause the service around password managers, payments, sensitive accounts, health/financial information, or important production data.
 
 See [SECURITY.zh-CN.md](SECURITY.zh-CN.md) / [SECURITY.en.md](SECURITY.en.md) for details.
+
+## File editing and search / 文件编辑与搜索
+
+0.3.0 新增 `edit_text_file`、`search_files` 和 `search_text`，支持带版本检查的精确局部编辑、递归文件名搜索和有界文本搜索。直接使用文件接口，不要求开启命令执行。用法、编码和边界见[文件工具说明](docs/file-tools.md)。
+
+Version 0.3.0 adds exact partial edits with read-associated versions, recursive filename search, and bounded literal text search. Command opt-in is not required. See [file tools, encodings and limits](docs/file-tools.md).

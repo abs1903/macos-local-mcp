@@ -105,6 +105,10 @@ def seatbelt_prefix(cwd: str, profile: str, network: bool = False) -> list[str]:
     Apple marks sandbox-exec deprecated but every current macOS still ships it.
     network=True allows outbound network inside the sandbox (needed for git/ssh
     builds); the default keeps the sandbox offline."""
+    if profile not in SEATBELT_PROFILES or type(network) is not bool:
+        raise ValueError("Invalid sandbox profile or network flag")
+    if any(ord(c) < 32 or ord(c) == 127 for c in cwd):
+        raise ValueError("cwd must not contain control characters")
     if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").exists():
         raise ValueError("sandbox profiles require macOS sandbox-exec (/usr/bin/sandbox-exec)")
     if '"' in cwd or "\\" in cwd:
@@ -114,9 +118,13 @@ def seatbelt_prefix(cwd: str, profile: str, network: bool = False) -> list[str]:
     script = SEATBELT_PROFILES[profile].replace(
         "{network}", "(allow network*)" if network else ""
     ).replace("{cwd}", _sbpl_quote(cwd))
-    fd, name = tempfile.mkstemp(prefix=".mcp-sb-", suffix=".sb", dir=cwd)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(script)
+    fd, name = tempfile.mkstemp(prefix=".mcp-sb-", suffix=".sb")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(script)
+    except BaseException:
+        Path(name).unlink(missing_ok=True)
+        raise
     return ["/usr/bin/sandbox-exec", "-f", name, "--"]
 
 
@@ -335,6 +343,8 @@ class Commands:
             raise ValueError("Unsupported output encoding")
         if sandbox is not None and sandbox not in SEATBELT_PROFILES:
             raise ValueError(f"sandbox must be one of {sorted(SEATBELT_PROFILES)} or None")
+        if type(network) is not bool:
+            raise ValueError("network must be a boolean")
         if network and sandbox is None:
             raise ValueError("network=True only applies when a sandbox profile is selected")
         if not isinstance(arguments, list) or len(arguments) > 256 or any(

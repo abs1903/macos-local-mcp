@@ -4,7 +4,7 @@
 
 Give ChatGPT in Chat mode MCP-based access to local files, file writes, screen viewing, and macOS desktop control. The MCP surface is intentionally close to the Windows version, while the desktop backend uses Quartz, the macOS Accessibility API, and macOS privacy permissions.
 
-Current version: 0.2.0.
+Current version: 0.3.0.
 
 ## Permissions and risks
 
@@ -31,9 +31,10 @@ The primary tools use the same names:
 | --- | --- |
 | File metadata and directories | file_info, list_directory |
 | Text and binary reads | read_text_file, read_binary_file |
+| Recursive filename and text search | search_files, search_text |
+| Exact partial edits with a version check | edit_text_file |
 | Create, replace, mkdir, move, Trash | write_file, create_directory, move_path, recycle_path |
-| Exact-match text editing | edit_text_file |
-| Search and verification | search_text, glob_files, file_hash |
+| Glob convenience and content verification | glob_files, file_hash |
 | Displays, windows, screenshots | desktop_monitors, desktop_windows, desktop_screenshot |
 | Focus a window and lock input | desktop_focus_window |
 | Mouse | desktop_click, desktop_move, desktop_drag, desktop_scroll |
@@ -63,7 +64,7 @@ Example `command_start` arguments for an installed Git:
 
 Poll the returned `job_id` with `command_poll`; pass the same ID to `command_cancel` to cancel it. **Starting is not success**: only `state=completed` with `exit_code=0` is successful. Nonzero exits, timeout, pause, cancellation and revoked approval remain distinct outcomes.
 
-`sandbox` selects an optional macOS Seatbelt (sandbox-exec) profile: `workspace-write` allows writes only inside cwd plus system temp directories and denies network; `read-only` denies all writes and network. `sandbox=None` (default) keeps raw current-user permissions. Profiles are deny-first, and the profile file is deleted when the job finishes. Known credential-shaped environment variables (GitHub/AWS/Anthropic/Google/Stripe tokens, SSH agent sockets, Tunnel/API keys) are stripped from the child environment in all modes.
+`sandbox` selects an optional macOS Seatbelt (`sandbox-exec`) profile. `workspace-write` permits writes in the resolved working directory and Darwin per-user temporary directories; `read-only` denies ordinary filesystem writes. Both retain standard-device access (including `/dev/null`) and deny network by default. Explicit `network=true` permits network with either profile. `sandbox=None` keeps current-user permissions. Profiles are stored in system temp and removed on normal cleanup; force-killing the service may leave a profile. This is not a hard security boundary. A denylist strips known credential/service environment variables, not every possible secret. `SSH_AUTH_SOCK` is deliberately retained for Git/SSH and grants access to the user's agent; network opt-in does not eliminate credential risk. Do not run untrusted commands merely because a profile is selected.
 
 Executable and cwd must be absolute paths; arguments must be an array. No shell is implicitly inserted, so spaces, semicolons, `$()` and globs are literal. Explicitly authorize a shell such as `/bin/zsh` and its script arguments when pipelines or redirects are required. `environment` can supply build variables; known Tunnel/API credentials and service-private variables are stripped and cannot be overridden. Executable symlink invocation paths are preserved for Homebrew and virtual environments.
 
@@ -141,20 +142,20 @@ Restore.command      browse/restore automatic file backups (local-only)
 - multiply linked, immutable, and extended-attribute-bearing files are refused by default to avoid losing special metadata during atomic replacement;
 - deletion goes to Trash and never falls back to permanent deletion;
 - writes, mkdir, move and Trash refuse well-known credential trees (~/.ssh, ~/.gnupg, ~/.aws, ~/Library/Keychains, ~/Library/Cookies) even though reads stay unrestricted;
-- move_path falls back to copy-then-Trash across volumes and never overwrites;
-- the service source tree and .local credentials/backups/audit state are hidden from MCP file tools, and search_text/glob_files never descend into the state directory.
+- move_path uses exclusive, no-overwrite renames. Across volumes it copies ordinary files/trees, verifies the source, then uses Trash. Links, special files, hardlinked files and unsupported metadata are refused. If Trash fails, `source_recycled=false` explicitly reports that both copies remain; no permanent deletion is attempted. This is not a filesystem transaction against hostile concurrent changes.
+- service source mutations are denied; private .local credentials/backups/audit data are denied for reads and writes. All search tools exclude private state.
 
 ### edit_text_file (preferred editing primitive)
 
-edit_text_file replaces an exact old_string with new_string, like a patch: the match must be unique (add surrounding lines to disambiguate, or pass replace_all=true), expected_modified_ns rejects stale edits, and the original is backed up automatically. For files up to 8 MiB of UTF-8 it avoids re-sending whole files and is far cheaper and safer than write_file for code changes.
+`edit_text_file` requires `old_text`, `new_text` and the `expected_version` returned by `read_text_file` or `file_info`. Exactly one occurrence must match, including overlapping matches; there is no replace-all mode. It preserves untouched bytes, BOM and line endings in UTF-8, UTF-8-sig, UTF-16 and GB18030 files up to 8 MiB. Changed content is backed up; stale versions require rereading. See [file-tool details](docs/file-tools.md).
 
 ### search_text and glob_files
 
-search_text greps one file or a whole directory tree (case-insensitive by default, opt-in regex, binary files and junk directories such as .git/node_modules are skipped) and returns bounded file/line/text hits. glob_files lists files matching a shell glob. Both never follow directory symlinks and stop at fixed caps (200 hits / 4000 files / 500 matches), so a runaway search cannot flood the context.
+`search_text(root, query)` performs literal single-line search under an explicit directory root, case-sensitive by default; no regular expressions are evaluated. `search_files` searches basename globs. `glob_files(path, pattern)` is a convenience wrapper over the same bounded engine, returning `matches` (at most 500). Searches skip links and private state and enforce entry, time and output limits; text search also limits total bytes. Inspect `skipped`, `truncated`, `stop_reason` and `complete`, including when no matches are found.
 
 ### Window-scoped screenshots and input bounds
 
-desktop_screenshot accepts target_window=true to capture only the locked target window, keeping other applications' pixels (private content and untrusted text) out of the model context. Mouse input must land inside the locked window's current bounds; clicking the menu bar or a same-process surface outside the target window is rejected (modal sheets in the target app are exempt because they legitimately extend past the window frame).
+`desktop_screenshot(target_window=true)` captures only the locked window after checking process/window ownership; changed geometry or identity during capture is rejected. It cannot be combined with `region`. Pointer input must stay within the current target bounds. A modal dialog uses its own verified bounds, never a blanket exemption; unidentifiable modal bounds fail closed.
 
 macOS has many ACL, File Provider, iCloud, sandbox-container, and third-party filesystem edge cases. The current version does not claim complete coverage of all special metadata semantics.
 
@@ -163,9 +164,9 @@ macOS has many ACL, File Provider, iCloud, sandbox-container, and third-party fi
 Automated coverage currently includes:
 
 - file create/read/replace/backup and stale-write checks;
-- edit_text_file uniqueness, replace_all, stale-edit and binary rejection;
+- edit_text_file uniqueness, mandatory versions, stale-edit rejection and encoding/newline preservation;
 - search_text/glob_files bounds, junk-directory and state-directory skipping;
-- credential-tree write rejection and cross-volume move fallback;
+- credential-tree and ancestor protection; injected EXDEV moves, destination races, pause, source changes and Trash failure;
 - symlink/xattr protections;
 - pause and audit behavior;
 - one-use and expiration behavior for observation IDs;
@@ -180,7 +181,7 @@ Automated coverage currently includes:
 - rechecking the target between typed characters;
 - mouse-up cleanup when a drag is interrupted;
 - Seatbelt read-only/workspace-write enforcement and profile cleanup (macOS);
-- credential environment filtering.
+- known-credential environment filtering, local restore confirmation/backup and atomic launch handoff records.
 
 GitHub Actions run portable tests and a macOS runner, with checks for PyObjC / Quartz / AppKit and the native APIs used by this project.
 
@@ -216,3 +217,15 @@ See [SECURITY.en.md](SECURITY.en.md).
 ## License
 
 MIT License. See [LICENSE](LICENSE).
+
+## File editing and search (0.3.0)
+
+Use `search_files` or `search_text` to narrow the scope, then inspect text with `read_text_file` and pass that exact string `version` as `edit_text_file.expected_version`. Editing requires one unique exact match; reread after a conflict. Changed files are backed up, and untouched bytes, BOM and UTF-16 byte order are retained. Searches have result, scan and time limits; inspect skipped/truncated fields. These three tools do not require command opt-in. See [parameters, encodings and boundaries](docs/file-tools.md).
+
+On macOS, replacement refuses files with ACLs or extended attributes, including resource forks. Failure to inspect either metadata type also refuses the write. Ordinary file mode and executable bits are preserved.
+
+### Local recovery and LaunchAgent
+
+`Restore.command list` lists newest backups first. `restore <index>` restores content only, requests confirmation through stdin when the destination exists, and first backs up that live content. It preserves the current ordinary mode but does not restore historical ownership, ACLs or timestamps; unsafe metadata is refused. It obeys local pause and protected paths.
+
+`LaunchDaemon.command` is a **user LaunchAgent** entry point despite its historical filename; never install it as a root daemon. Point a locally managed plist at the script and use `KeepAlive.SuccessfulExit=false`. Do not start it concurrently with `Start.command`; the existing-process check is not a startup mutex. Its atomic record names the intended Tunnel executable before exec handoff. Keychain/TCC interaction still requires physical-Mac validation.
